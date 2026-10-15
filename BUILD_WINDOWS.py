@@ -71,6 +71,7 @@ def main():
         shutil.rmtree(BUNDLE/name,ignore_errors=True);(BUNDLE/name).mkdir()
     shutil.copy2(ROOT/'START_WINDOWS_BUILD.txt',BUNDLE/'START_HERE.txt')
     shutil.copy2(ROOT/'FOREIGN_DETECTOR_START_HERE.txt',BUNDLE/'FOREIGN_DETECTOR_START_HERE.txt')
+    shutil.copy2(ROOT/'OAK_MANUAL_TEST_START_HERE.txt',BUNDLE/'OAK_MANUAL_TEST_START_HERE.txt')
     shutil.copy2(LOGS/'installed-versions.txt',BUNDLE/'BUILD_VERSIONS.txt')
     prerequisites=BUNDLE/'prerequisites';prerequisites.mkdir(exist_ok=True)
     shutil.copy2(ROOT/'vc_redist.x64.exe',prerequisites/'vc_redist.x64.exe')

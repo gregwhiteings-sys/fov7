@@ -69,3 +69,7 @@ renders all five tabs at three window sizes. Linux offscreen checks also ran
 with QT_SCALE_FACTOR=1.5; the Windows workflow must confirm the target platform.
 Update the main app, build_support/smoke_test.py, control_layout_test.py and
 .github/workflows/windows-portable.yml together, or upload all extracted contents.
+
+MANUAL OAK TEST UPDATE
+See OAK_MANUAL_TEST_START_HERE.txt. Manual OAK tests can run at any hour,
+write to a separate test DB and hand back to next 05:00 Auto production start.

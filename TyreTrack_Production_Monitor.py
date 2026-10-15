@@ -118,6 +118,7 @@ except Exception:
 APP_NAME = "TYRECYCLE | TYRETRACK"
 MODEL_NAME = "tyre_detector.pt"
 OAK_NAME = "OAK-D S2 PoE / CAT5"
+OAK_TEST_NAME = "OAK-D S2 / MANUAL TEST"
 
 IOU_DEFAULT = 0.50
 INFERENCE_SIZE = 480
@@ -350,6 +351,15 @@ def classification_counts(start=None, end=None, source=None):
     return result
 
 
+def log_oak_test_count(source, track_id, confidence, tyre_type, class_confidence):
+    # Use an independent DB, so legacy CSV exports cannot absorb manual tests.
+    with sqlite3.connect(DATA / "oak_manual_tests.db", timeout=15) as con:
+        con.execute("CREATE TABLE IF NOT EXISTS counts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, source TEXT, track_id INTEGER, confidence REAL, tyre_type TEXT, class_confidence REAL, metric_utc REAL)")
+        con.execute("INSERT INTO counts(ts,source,track_id,confidence,tyre_type,class_confidence,metric_utc) VALUES(?,?,?,?,?,?,?)",
+                    (brisbane_now().isoformat(),source,int(track_id),float(confidence),
+                     tyre_class_name(tyre_type),float(class_confidence),time.time()))
+
+
 def log_count(
     source,
     track_id,
@@ -357,6 +367,9 @@ def log_count(
     tyre_type="unknown",
     class_confidence=0.0
 ):
+    if source == OAK_TEST_NAME:
+        log_oak_test_count(source,track_id,confidence,tyre_type,class_confidence)
+        return
     tyre_type = tyre_class_name(tyre_type)
 
     with sqlite3.connect(DB, timeout=15) as con:
@@ -720,6 +733,10 @@ def send_hourly_email(start, end):
 def oak_in_operating_hours():
     now = datetime.now(timezone(timedelta(hours=10)))
     return 5 <= now.hour and (now.hour < 17 or (now.hour == 17 and now.minute < 5))
+
+
+def oak_session_allowed(manual_test=False):
+    return bool(manual_test) or oak_in_operating_hours()
 
 
 def oak_stream_stopped():
@@ -1447,6 +1464,9 @@ class CounterWorker(QThread):
     ):
         super().__init__()
 
+        self.manual_test = False
+        self.manual_test_end = None
+        self.session_started_monotonic = time.monotonic()
         self.source_kind = source_kind
         self.source = source
         self.direction = direction
@@ -1537,7 +1557,7 @@ class CounterWorker(QThread):
             event=self.foreign_confirm.update(detections,time.monotonic())
             if event and not self.foreign_latched:
                 self.foreign_latched=True
-                self.foreign_event.emit(dict(event,frame=frame.copy(),source_kind=self.source_kind,
+                self.foreign_event.emit(dict(event,frame=frame.copy(),source_kind="oak_test" if self.manual_test else self.source_kind,
                                              source=str(self.source),timestamp=brisbane_now().isoformat()))
         except Exception as exc:
             self.foreign_failed=True
@@ -1585,7 +1605,7 @@ class CounterWorker(QThread):
             if self.source_kind == "oak":
                 source = OakSource(str(self.source or ""))
                 self.oak_source = source
-                source_name = OAK_NAME
+                source_name = OAK_TEST_NAME if self.manual_test else OAK_NAME
             else:
                 source = cv2.VideoCapture(self.source)
                 if not source.isOpened():
@@ -1644,7 +1664,7 @@ class CounterWorker(QThread):
                     )
 
             while self.running:
-                if self.source_kind == "oak" and not oak_in_operating_hours():
+                if self.source_kind == "oak" and not oak_session_allowed(self.manual_test):
                     break
                 if self.source_kind == "oak":
                     ok, frame, frame_sequence = source.read()
@@ -1849,7 +1869,7 @@ class CounterWorker(QThread):
                         if crossed:
                             crossed=crosses_segment(previous,side,self.previous_x.get(key,cx),cx,ll,rr)
                         if crossed:
-                            if self.source_kind == "oak" and (not self.running or not oak_in_operating_hours()):
+                            if self.source_kind == "oak" and (not self.running or not oak_session_allowed(self.manual_test)):
                                 continue
                             if track_id not in self.counted_ids:
                                 # Persist this single-line crossing once before updating totals.
@@ -2580,6 +2600,12 @@ class Main(QMainWindow):
         self.auto_schedule.toggled.connect(self.auto_schedule_changed)
         source_layout.addWidget(self.auto_schedule)
         source_layout.addWidget(schedule_note)
+        self.manual_oak_test = QCheckBox("Manual OAK test · any time")
+        self.manual_oak_test.setChecked(False)
+        source_layout.addWidget(self.manual_oak_test)
+        test_note=QLabel("Check this and press Start to test OAK outside production hours. Test counts stay separate; no production emails. With Auto enabled, an overnight test hands over at the next 05:00 Brisbane start.")
+        test_note.setWordWrap(True)
+        source_layout.addWidget(test_note)
 
         self.record_oak_checkbox = QCheckBox(
             "Record OAK video (MP4)"
@@ -3391,6 +3417,12 @@ class Main(QMainWindow):
             return
         now = brisbane_now()
         running = self.worker is not None and self.worker.isRunning()
+        if running and self.worker.source_kind == "oak" and getattr(self.worker,"manual_test",False):
+            deadline=getattr(self.worker,"manual_test_end",None)
+            if deadline is not None and now>=deadline:
+                self.stop(scheduled=True)
+                self.auto_retry_at=0.0
+            return
         if not oak_in_operating_hours():
             if running and self.worker.source_kind == "oak":
                 self.stop(scheduled=True)
@@ -3424,6 +3456,7 @@ class Main(QMainWindow):
         return "oak", ""
 
     def set_running_controls(self, running):
+        self.manual_oak_test.setEnabled(not running)
         self.foreign_switch.setEnabled(not running)
         self.foreign_conf.setEnabled(not running)
         self.foreign_every.setEnabled(not running)
@@ -3477,9 +3510,12 @@ class Main(QMainWindow):
             return
 
         self.auto_attempt = automatic
-        if selected[0] == "oak":
+        manual_test = selected[0] == "oak" and not automatic and self.manual_oak_test.isChecked()
+        if selected[0] == "oak" and not manual_test:
             set_state("auto_paused_day", "")
         try:
+            if selected[0] == "oak" and not oak_session_allowed(manual_test):
+                raise ValueError("Outside 05:00–17:05 Brisbane production hours. Enable 'Manual OAK test · any time', then press Start.")
             if self.foreign_switch.isChecked():
                 t,b,l,r=self.foreign_region_values()
                 if not (t<b and l<r):raise ValueError("Foreign region requires top < bottom and left < right")
@@ -3497,6 +3533,12 @@ class Main(QMainWindow):
                 self.line_angle.value(),
                 self.line_length.value() / 100.0,
             )
+            worker.manual_test=manual_test
+            worker.session_started_monotonic=time.monotonic()
+            if manual_test:
+                now=brisbane_now()
+                next_start=now.replace(hour=5,minute=0,second=0,microsecond=0)
+                worker.manual_test_end=next_start if now<next_start else next_start+timedelta(days=1)
             worker.overlay_mode = self.overlay_mode_combo.currentText()
             worker.show_tyre_labels = (
                 self.show_tyre_labels.isChecked()
@@ -3548,7 +3590,7 @@ class Main(QMainWindow):
                 self.status_lbl.setText(f"Auto OAK start failed; retry in 60 seconds: {exc}")
 
     def stop(self, checked=False, scheduled=False):
-        if not scheduled and self.worker is not None and self.worker.source_kind == "oak":
+        if not scheduled and self.worker is not None and self.worker.source_kind == "oak" and not self.worker.manual_test:
             set_state("auto_paused_day", brisbane_now().date().isoformat())
         if self.worker is not None:
             self.worker.stop()
@@ -3593,9 +3635,10 @@ class Main(QMainWindow):
                     + str(LOG),
                 )
         elif status == "COUNTING":
-            self.health.setText(
-                "● COUNTING"
-            )
+            is_test=self.worker is not None and self.worker.manual_test
+            if is_test:
+                self.status_lbl.setText("OAK MANUAL TEST · live camera · counts excluded from production")
+            self.health.setText("● OAK TEST" if is_test else "● COUNTING")
             self.health.setStyleSheet(
                 "color:#7de7bc"
             )
@@ -3608,10 +3651,12 @@ class Main(QMainWindow):
     def on_count(self, _track_id, _confidence):
         # Already committed to SQLite in CounterWorker.
         self.session += 1
-        if self.worker is not None and self.worker.source_kind == "video":
-            self.test_events.append(self.worker.processing_frame / max(1.0, self.worker.video_fps))
+        if self.worker is not None and (self.worker.source_kind == "video" or self.worker.manual_test):
+            elapsed=(self.worker.processing_frame / max(1.0,self.worker.video_fps)
+                     if self.worker.source_kind=="video" else time.monotonic()-self.worker.session_started_monotonic)
+            self.test_events.append(elapsed)
 
-        if self.worker is not None and self.worker.source_kind == "oak":
+        if self.worker is not None and self.worker.source_kind == "oak" and not self.worker.manual_test:
             try:
                 export_daily_csv()
                 export_classification_csv()
@@ -3694,9 +3739,10 @@ class Main(QMainWindow):
 
     def refresh_counts(self):
         worker = self.worker
-        test_mode = bool(worker is not None and worker.source_kind == "video")
+        test_mode = bool(worker is not None and (worker.source_kind == "video" or worker.manual_test))
         if test_mode:
-            elapsed = worker.processing_frame / max(1.0, worker.video_fps)
+            elapsed = (worker.processing_frame / max(1.0,worker.video_fps) if worker.source_kind=="video"
+                       else time.monotonic()-worker.session_started_monotonic)
             events = sorted(self.test_events)
             hour_index = min(12, int(elapsed // 3600))
             this_hour = sum(hour_index*3600 <= t < min((hour_index+1)*3600, 43500) for t in events)
@@ -3721,7 +3767,7 @@ class Main(QMainWindow):
             self.no_count_lbl.setToolTip("Video elapsed time when the 10-minute threshold was reached")
             self.flow_lbl.setText(f"{last_five / max(1/60, min(300, max(elapsed,1))) * 60:.1f} tyres per min")
             self.gap_lbl.setText(f"{sum(gaps)/60:.0f} min")
-            self.production_status_lbl.setText("TEST · NO COUNT" if elapsed >= 600 and (trailing >= 600 or not events) else "TEST MODE")
+            self.production_status_lbl.setText("TEST · NO COUNT" if elapsed >= 600 and (trailing >= 600 or not events) else "OAK MANUAL TEST" if worker.manual_test else "TEST MODE")
             self.all_time_lbl.setText("TEST SESSION  " + str(len(events)))
             self.passenger_lbl.setText(str(types.get("passenger",0)))
             self.suv_lbl.setText(str(types.get("4x4",0)))
@@ -3925,7 +3971,9 @@ class Main(QMainWindow):
                 + traceback.format_exc()
             )
 
-        # Never send live production reports or no-count alerts during video tests.
+        # Manual OAK and video tests never send live production reports or alerts.
+        if self.worker is not None and self.worker.manual_test:
+            return
         if self.worker is not None and self.worker.source_kind != "oak":
             return
         if not self.auto_schedule.isChecked() and (self.worker is None or not self.worker.isRunning()):
